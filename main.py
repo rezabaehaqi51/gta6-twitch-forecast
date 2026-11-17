@@ -16,8 +16,11 @@ hour 1. The case ships the full hourly curves of ~40 past big launches
      differently from one that unlocked into an empty category.
   3. Per hour, take the weighted distribution of the log ratios: blend its
      empirical quantiles with a normal fit (weighted mean/sd), tilt the
-     centre by a shrunk regression of the ratio on launch size, and widen
-     or narrow the spread by a calibration factor fitted offline by
+     centre by shrunk regressions of the ratio on launch size and on
+     pre-release heat (how hot the category already was in the three
+     hours before the UTC day, relative to hour 1), and widen or narrow
+     the spread by calibration factors — global, per hour block,
+     asymmetric, and a tail factor — fitted offline by
      leave-one-launch-out validation over the comparables themselves.
   4. Quantiles are hour-1 print x exp(log-ratio quantile), clamped to the
      contest's range and forced non-decreasing.
@@ -50,22 +53,32 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]  # standard normal quantiles
 
-# --- Model parameters (fitted by tools/lolo.py, leave-one-launch-out) ---
+# --- Model parameters (fitted by tools/lolo.py + tools/tune2.py) ---
 # LOLO over the 37 launches in the practice cases: GTA-family targets
-# (console-only, full tier, rolling unlock) score 0.164 against the house
-# baseline's 0.344 on the same targets; the four biggest non-early
-# launches score 0.155. See tools/lolo.py and DESIGN.md.
+# (console-only, full tier, rolling unlock) score 0.144 against the house
+# baseline's 0.344 on the same targets; launches with hour 1 >= 100k
+# score 0.220; the full pool scores 0.450. The v2 additions are a
+# pre-release heat tilt (pre_shrink) and per-hour-block / asymmetric /
+# tail spread calibration. See tools/tune2.py and DESIGN.md.
 PARAMS = {
     "w_tier_early": 0.5,       # early-access tier weight factor
-    "w_tier_weak": 0.1,        # live-service / weak tier weight factor
+    "w_tier_weak": 0.5,        # live-service / weak tier weight factor
     "w_pc": 0.3,               # comparable includes PC (target is console-only)
     "w_simultaneous": 0.05,    # single global unlock, no rolling console wave
     "size_sigma": 1.5,         # size kernel width on ln(hour-1 viewers)
-    "size_floor": 0.05,        # size kernel floor
-    "blend_normal": 0.15,      # weight of the normal fit vs empirical quantiles
-    "spread": 0.8,             # global spread calibration multiplier
+    "size_floor": 0.0,         # size kernel floor
+    "blend_normal": 0.4,       # weight of the normal fit vs empirical quantiles
+    "spread": 0.7,             # global spread calibration multiplier
+    "sp_g1": 1.15,             # spread multiplier, hours 2-5
+    "sp_g2": 1.0,              # spread multiplier, hours 6-12
+    "sp_g3": 0.85,             # spread multiplier, hours 13-18
+    "sp_g4": 0.85,             # spread multiplier, hours 19-24
+    "sp_lo": 1.0,              # extra multiplier below the median
+    "sp_hi": 0.85,             # extra multiplier above the median
+    "tail": 1.1,               # extra multiplier on the 5%/95% quantiles
     "smooth": 0,               # 1: smooth log quantiles over neighbouring hours
     "tilt_shrink": 0.5,        # shrinkage of the size-tilt slope
+    "pre_shrink": 0.5,         # shrinkage of the pre-release heat tilt
     "min_weight": 0.05,        # drop comparables weighted below this
     "min_pool": 6,             # fall back when fewer usable comparables
 }
@@ -172,8 +185,31 @@ def weighted_quantile(sorted_pairs, tau):
     return sorted_pairs[-1][0]
 
 
+def pre_release_heat(points, day_start, log_ref):
+    """Mean ln(viewers / exp(log_ref)) over the 3 hours before day_start.
+
+    `points` are hourly rows with `from`/`viewers` (a comparable's
+    `hourly`, or the case's `history_hourly` for the target itself).
+    Returns None when none of those three hours is present. A launch
+    whose category was already hot in the hours before the UTC day
+    tends to run a flatter day than one that starts cold, so this is a
+    centre-tilt feature, fitted like the size tilt.
+    """
+    start = parse_ts(day_start)
+    vals = []
+    for point in points or []:
+        viewers = point.get("viewers")
+        if viewers is None or viewers <= 0:
+            continue
+        idx = int((parse_ts(point["from"]) - start).total_seconds()
+                  // 3600) + 1
+        if idx in (0, -1, -2):
+            vals.append(math.log(float(viewers)) - log_ref)
+    return sum(vals) / len(vals) if vals else None
+
+
 def build_pool(case, params):
-    """Usable comparables: [(ratios {h: log ratio}, weight, log_h1)]."""
+    """Usable comparables: [(ratios, weight, log_h1, pre3)]."""
     known = next((k for k in case["known"] if k["hour"] == 1), None)
     if known is None:
         raise ValueError("case has no hour-1 print")
@@ -197,33 +233,65 @@ def build_pool(case, params):
         w = comp_weight(feat, target, math.log(v1), log_p1, params)
         if w < params["min_weight"]:
             continue
-        pool.append((ratios, w, math.log(v1)))
+        pre3 = pre_release_heat(comp.get("hourly"), comp["day_start"],
+                                math.log(v1))
+        pool.append((ratios, w, math.log(v1), pre3))
     return p1, pool
 
 
-def forecast_from_pool(p1, pool, params):
-    """The 23 forecast rows from a built pool (shared by entry + validator)."""
+def _group_mult(h, params):
+    if h <= 5:
+        return params["sp_g1"]
+    if h <= 12:
+        return params["sp_g2"]
+    if h <= 18:
+        return params["sp_g3"]
+    return params["sp_g4"]
+
+
+def forecast_from_pool(p1, pool, params, target_pre3=None):
+    """The 23 forecast rows from a built pool (shared by entry + validator).
+
+    Pool entries are (ratios, weight, log_h1, pre3); `target_pre3` is the
+    target's own pre-release heat (see pre_release_heat), or None.
+    """
     log_p1 = math.log(p1)
-    # Per-hour weighted centre, spread and size tilt from the pool.
+    # Per-hour weighted centre, spread and tilts from the pool.
     rows = []
     for h in range(2, 25):
-        sample = [(r[h], w, lh1) for r, w, lh1 in pool if h in r]
+        sample = [(r[h], w, lh1, pre3) for r, w, lh1, pre3 in pool
+                  if h in r]
         if len(sample) < 3:
             rows.append(None)
             continue
         sample.sort(key=lambda t: t[0])
-        pairs = [(v, w) for v, w, _ in sample]
-        wsum = sum(w for _, w, _ in sample)
-        mean = sum(v * w for v, w, _ in sample) / wsum
-        var = sum(w * (v - mean) ** 2 for v, w, _ in sample) / wsum
+        pairs = [(v, w) for v, w, _, _ in sample]
+        wsum = sum(w for _, w, _, _ in sample)
+        mean = sum(v * w for v, w, _, _ in sample) / wsum
+        var = sum(w * (v - mean) ** 2 for v, w, _, _ in sample) / wsum
         sd = math.sqrt(max(var, 1e-6))
         # Size tilt: does the log ratio lean on launch size? Weighted
         # regression slope of ratio on ln(hour-1), shrunk toward zero.
-        xbar = sum(lh1 * w for _, w, lh1 in sample) / wsum
-        sxx = sum(w * (lh1 - xbar) ** 2 for _, w, lh1 in sample)
-        sxy = sum(w * (lh1 - xbar) * (v - mean) for v, w, lh1 in sample)
+        xbar = sum(lh1 * w for _, w, lh1, _ in sample) / wsum
+        sxx = sum(w * (lh1 - xbar) ** 2 for _, w, lh1, _ in sample)
+        sxy = sum(w * (lh1 - xbar) * (v - mean) for v, w, lh1, _ in sample)
         slope = (sxy / sxx) if sxx > 1e-9 else 0.0
         centre = mean + params["tilt_shrink"] * slope * (log_p1 - xbar)
+        # Pre-release heat tilt: the same shrunk regression on the
+        # pool's pre-release heat, applied when the target's is known.
+        if params["pre_shrink"] and target_pre3 is not None:
+            pts = [(pre3, v, w) for v, w, _, pre3 in sample
+                   if pre3 is not None]
+            if len(pts) >= 6:
+                tw = sum(w for _, _, w in pts)
+                pxbar = sum(x * w for x, _, w in pts) / tw
+                pybar = sum(y * w for _, y, w in pts) / tw
+                psxx = sum(w * (x - pxbar) ** 2 for x, _, w in pts)
+                psxy = sum(w * (x - pxbar) * (y - pybar)
+                           for x, y, w in pts)
+                if psxx > 1e-9:
+                    centre += params["pre_shrink"] * (psxy / psxx) \
+                        * (target_pre3 - pxbar)
         qs = []
         for tau, z in zip(LEVELS, Z):
             emp = weighted_quantile(pairs, tau)
@@ -260,8 +328,25 @@ def forecast_from_pool(p1, pool, params):
             smoothed.append([0.25 * a + 0.5 * b + 0.25 * c
                              for a, b, c in zip(left, qs, right)])
         rows = smoothed
-    # Spread calibration around each hour's median (the tau=0.5 entry).
-    rows = [[qs[2] + params["spread"] * (q - qs[2]) for q in qs] for qs in rows]
+    # Spread calibration around each hour's median (the tau=0.5 entry):
+    # a global factor, a per-hour-block factor, an asymmetric factor
+    # below/above the median, and an extra factor on the tail quantiles.
+    calibrated = []
+    for i, qs in enumerate(rows):
+        gm = _group_mult(i + 2, params)
+        med = qs[2]
+        adj = []
+        for j, q in enumerate(qs):
+            d = (q - med) * params["spread"] * gm
+            if j < 2:
+                d *= params["sp_lo"]
+            elif j > 2:
+                d *= params["sp_hi"]
+            if j in (0, 4):
+                d *= params["tail"]
+            adj.append(med + d)
+        calibrated.append(adj)
+    rows = calibrated
     out = []
     for i, qs in enumerate(rows):
         vals = []
@@ -298,7 +383,9 @@ def forecast_case(case, params=PARAMS):
     p1, pool = build_pool(case, params)
     if len(pool) < params["min_pool"]:
         return baseline_forecast(p1)
-    result = forecast_from_pool(p1, pool, params)
+    target_pre3 = pre_release_heat(case.get("history_hourly"),
+                                   case["day_start"], math.log(p1))
+    result = forecast_from_pool(p1, pool, params, target_pre3)
     if result is None:
         return baseline_forecast(p1)
     return result

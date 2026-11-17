@@ -41,6 +41,9 @@ def load_pool(case):
         out.append({
             "name": comp["name"], "ratios": ratios, "feat": feat,
             "log_h1": math.log(v1), "actual": hours, "p1": v1,
+            "pre3": model.pre_release_heat(comp.get("hourly"),
+                                           comp["day_start"],
+                                           math.log(v1)),
         })
     return out
 
@@ -71,8 +74,8 @@ def evaluate(pool, params):
                                   c["log_h1"], tgt["log_h1"], params)
             if w < params["min_weight"]:
                 continue
-            sub.append((c["ratios"], w, c["log_h1"]))
-        fc = model.forecast_from_pool(tgt["p1"], sub, params)
+            sub.append((c["ratios"], w, c["log_h1"], c["pre3"]))
+        fc = model.forecast_from_pool(tgt["p1"], sub, params, tgt["pre3"])
         if fc is None:
             fc = model.baseline_forecast(tgt["p1"])
         losses[tgt["name"]] = pinball(fc, tgt["actual"])

@@ -14,13 +14,17 @@ Hour-1 anchored log-ratio analogues, rebuilt from the case at runtime:
 
 - For each comparable launch: `r_c(h) = ln(v_h / v_1)` over its release day.
 - Weights = analogue quality for a console-only, rolling-midnight,
-  single-player target: house tier (early-access ×0.5, live-service ×0.1),
+  single-player target: house tier (early-access ×0.5, live-service ×0.5),
   PC-including ×0.3, single-global-unlock ×0.05, and a Gaussian size
-  kernel on `ln(hour-1 viewers)` (sigma 1.5, floor 0.05) — GTA VI's first
+  kernel on `ln(hour-1 viewers)` (sigma 1.5, floor 0) — GTA VI's first
   hour will already be hot, so launches that started hot are the evidence.
-- Per hour: weighted empirical quantiles of the ratios blended 85/15 with
-  a normal fit, centre tilted by a shrunk (×0.5) regression of the ratio
-  on launch size, spread calibrated ×0.8 around the median.
+- Per hour: weighted empirical quantiles of the ratios blended 60/40 with
+  a normal fit, centre tilted by shrunk (×0.5) regressions of the ratio
+  on launch size and on pre-release heat (the mean log level of the
+  three hours before the UTC day relative to hour 1: a category already
+  hot before midnight runs a flatter day), spread calibrated around the
+  median (×0.7 global; ×1.15 for hours 2–5, ×0.85 for hours 13–24 and
+  above the median, ×1.1 on the tail quantiles).
 - The GTA VI category's own premiere-day record (tier `target`) is never
   used as a launch analogue. Too few analogues → house-baseline fallback.
 
@@ -30,11 +34,19 @@ Leave-one-launch-out over the 37 launches inside the practice cases:
 each launch is forecast from the other 36 through the exact production
 pipeline and scored with the contest's pinball loss on the log scale.
 
-| target set | this model | house baseline |
-| --- | --- | --- |
-| GTA-family (console-only, full tier, rolling) | **0.164** | 0.344 |
-| four biggest non-early launches (h1 ≥ 250k) | **0.155** | — |
-| all 37 launches | 0.478 | 0.930 |
+| target set | this model (v2) | v1 | house baseline |
+| --- | --- | --- | --- |
+| GTA-family (console-only, full tier, rolling) | **0.144** | 0.164 | 0.344 |
+| launches with hour 1 ≥ 100k (16) | **0.220** | 0.230 | — |
+| all 37 launches | 0.450 | 0.478 | 0.930 |
+
+v2 (tools/tune2.py) was tuned on a robust objective — GTA-family mean
+plus the big-launch and full-pool means — not on the 7 GTA-family
+targets alone: it wins 24 of 37 targets against v1, its GTA-family
+jackknife range (0.131–0.153) sits entirely below v1's (0.156–0.173),
+and the single biggest gain is the pre-release heat tilt. Knobs that
+only fit noise (a recency weight, viewers-per-channel and pre-release
+slope tilts, finer second-round spread moves) were tested and dropped.
 
 The all-launches number is worse by design: the model specialises away
 from near-empty-hour-1 global unlocks (Wukong, Silksong), whose day shape
