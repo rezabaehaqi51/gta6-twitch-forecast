@@ -53,6 +53,36 @@ from near-empty-hour-1 global unlocks (Wukong, Silksong), whose day shape
 says nothing about GTA VI's. The practice targets (Wolverine, RDR2, God
 of War Ragnarök, Spider-Man 2) all sit in the GTA family.
 
+## v3 — an ensemble on top of v2 (tools/tune3.py, tune4.py, tune5.py)
+
+GTA VI is GTA-family by construction and almost surely big (its own
+category printed 1.42M viewers for a premiere event), so v3 is judged
+on the union of the two validation subsets. Around the v2 pipeline,
+four members were built and blended in log-quantile space: the base
+model; the base with pool weights sharpened by a pre-release-heat
+kernel; the base over hour-smoothed ratio curves; and a low-variance
+global parameter set. The shipped weights (0.65 / 0.18 / 0.12 / 0.05,
+base / heat-kernel / smoothed / global) score:
+
+| target set | v3 ensemble | v2 |
+| --- | --- | --- |
+| GTA-family | 0.144 | 0.144 |
+| launches with hour 1 ≥ 100k | **0.214** | 0.220 |
+| union of the two (21) | **0.200** | 0.205 |
+| all 37 launches | 0.449 | 0.450 |
+
+Tested and rejected on the same validation: per-hour spread
+calibration on top of the blend (nothing survived the acceptance
+threshold), a pool-internal LOLO bias correction (helped the full
+pool, hurt the GTA family), a family-only bias correction and a
+family-specialist blend (same trade), peak-aligned curve averaging
+(worse everywhere), top-k local pools, a stronger size tilt, and a
+cap on the size tilt's extrapolation. The shipped program reproduces
+the blend's LOLO numbers exactly; one divergence from the tuner was
+found and fixed in the process — a minimum-pool gate in the entry
+path sent small-hour-1 targets to the persistence fallback that the
+validation never used.
+
 ## Data notes
 
 - `platforms` in a case is one comma-separated string, not a list — the

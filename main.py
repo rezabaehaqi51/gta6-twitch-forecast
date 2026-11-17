@@ -24,6 +24,18 @@ hour 1. The case ships the full hourly curves of ~40 past big launches
      leave-one-launch-out validation over the comparables themselves.
   4. Quantiles are hour-1 print x exp(log-ratio quantile), clamped to the
      contest's range and forced non-decreasing.
+  5. The shipped forecast is a small ensemble: the pipeline above runs
+     four ways — as described; with pool weights sharpened by a
+     pre-release-heat kernel (launches whose pre-day heat matches the
+     target's count more); with each launch's ratio curve smoothed over
+     neighbouring hours before quantiles are taken (shape first, hourly
+     noise second); and with a low-variance global parameter set (wide
+     size kernel, weak tier discounts) — and the four log-quantile sets
+     are averaged with fixed weights (0.65 / 0.18 / 0.12 / 0.05) fitted
+     by the same leave-one-launch-out validation. No single variant beat
+     the base model on every validation subset; the blend ties it on
+     GTA-family launches and beats it on big launches and on the union
+     of the two, which is the posture wanted for a target that is both.
 
 The GTA VI category's own premiere-day entry in `comparables` (tier
 "target") is not a game launch and never enters the pool. If a case carries
@@ -57,7 +69,8 @@ Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]  # standard normal quantiles
 # LOLO over the 37 launches in the practice cases: GTA-family targets
 # (console-only, full tier, rolling unlock) score 0.144 against the house
 # baseline's 0.344 on the same targets; launches with hour 1 >= 100k
-# score 0.220; the full pool scores 0.450. The v2 additions are a
+# score 0.214 under the v3 ensemble (0.220 for this base member alone);
+# the full pool scores 0.449. The v2 additions are a
 # pre-release heat tilt (pre_shrink) and per-hour-block / asymmetric /
 # tail spread calibration. See tools/tune2.py and DESIGN.md.
 PARAMS = {
@@ -84,6 +97,21 @@ PARAMS = {
 }
 
 BASELINE_SIGMA = 0.15  # house baseline persistence spread (fallback only)
+
+# The ensemble's global member: same pipeline, low-variance parameters
+# (wide size kernel with a floor, gentler tier discounts, stronger
+# normal blend, weaker heat tilt). See tools/tune3.py / tune5.py.
+GLOBAL_PARAMS = dict(PARAMS, size_sigma=4.0, size_floor=0.3,
+                     blend_normal=0.5, w_pc=0.55, w_simultaneous=0.25,
+                     pre_shrink=0.35)
+
+# Ensemble weights over (base, heat-kernel, smoothed-curves, global),
+# fitted by leave-one-launch-out on the union of GTA-family and big
+# launches (tools/tune5.py): union 0.200 vs the base model's 0.205,
+# GTA-family 0.144 vs 0.144, big launches 0.214 vs 0.220.
+BLEND = (0.65, 0.18, 0.12, 0.05)
+PRE_KERNEL_SIGMA = 1.0   # width of the pre-release heat kernel
+SMOOTH_WIDTH = 5         # moving-average width for the smoothed member
 
 
 def parse_ts(text):
@@ -249,11 +277,35 @@ def _group_mult(h, params):
     return params["sp_g4"]
 
 
-def forecast_from_pool(p1, pool, params, target_pre3=None):
-    """The 23 forecast rows from a built pool (shared by entry + validator).
+def smooth_curve(ratios, width):
+    """Centred moving average of a {hour: log ratio} curve.
+
+    Neighbours outside the recorded hours take the nearest recorded
+    value, so the curve's ends flatten instead of dropping out.
+    """
+    if width <= 1:
+        return dict(ratios)
+    half = width // 2
+    keys = sorted(ratios)
+    out = {}
+    for h in keys:
+        vals = []
+        for d in range(-half, half + 1):
+            hh = h + d
+            if hh in ratios:
+                vals.append(ratios[hh])
+            else:
+                vals.append(ratios[keys[0] if hh < keys[0] else keys[-1]])
+        out[h] = sum(vals) / len(vals)
+    return out
+
+
+def log_rows_from_pool(p1, pool, params, target_pre3=None):
+    """The 23 rows of calibrated log-ratio quantiles from a built pool.
 
     Pool entries are (ratios, weight, log_h1, pre3); `target_pre3` is the
     target's own pre-release heat (see pre_release_heat), or None.
+    Returns None when the pool yields no usable hour at all.
     """
     log_p1 = math.log(p1)
     # Per-hour weighted centre, spread and tilts from the pool.
@@ -346,7 +398,11 @@ def forecast_from_pool(p1, pool, params, target_pre3=None):
                 d *= params["tail"]
             adj.append(med + d)
         calibrated.append(adj)
-    rows = calibrated
+    return calibrated
+
+
+def format_rows(p1, rows):
+    """Log-ratio quantile rows -> the contest's viewer-quantile rows."""
     out = []
     for i, qs in enumerate(rows):
         vals = []
@@ -359,6 +415,59 @@ def forecast_from_pool(p1, pool, params, target_pre3=None):
             prev = v
         out.append({"hour": i + 2, "q": vals})
     return {"hours": out}
+
+
+def forecast_from_pool(p1, pool, params, target_pre3=None):
+    """The 23 forecast rows from a built pool (shared by entry + validator)."""
+    rows = log_rows_from_pool(p1, pool, params, target_pre3)
+    if rows is None:
+        return None
+    return format_rows(p1, rows)
+
+
+def ensemble_rows(p1, pool, global_pool, target_pre3):
+    """Blend the four ensemble members' log-quantile rows.
+
+    Members: the base pool as built; the base pool with weights
+    sharpened by the pre-release heat kernel; the base pool with each
+    launch's curve smoothed over neighbouring hours; and the pool
+    rebuilt under the global parameters. A member that yields nothing
+    drops out and the remaining weights renormalise.
+    """
+    members = []
+    base = log_rows_from_pool(p1, pool, PARAMS, target_pre3)
+    if base is not None:
+        members.append((BLEND[0], base))
+    if target_pre3 is not None:
+        kern = []
+        for ratios, w, lh1, pre3 in pool:
+            if pre3 is not None:
+                d = (pre3 - target_pre3) / PRE_KERNEL_SIGMA
+                w = w * (0.1 + 0.9 * math.exp(-0.5 * d * d))
+            if w >= PARAMS["min_weight"]:
+                kern.append((ratios, w, lh1, pre3))
+        if len(kern) >= 3:
+            rows = log_rows_from_pool(p1, kern, PARAMS, target_pre3)
+            if rows is not None:
+                members.append((BLEND[1], rows))
+    smoothed = [(smooth_curve(r, SMOOTH_WIDTH), w, lh1, pre3)
+                for r, w, lh1, pre3 in pool]
+    rows = log_rows_from_pool(p1, smoothed, PARAMS, target_pre3)
+    if rows is not None:
+        members.append((BLEND[2], rows))
+    if global_pool is not None and len(global_pool) >= 3:
+        rows = log_rows_from_pool(p1, global_pool, GLOBAL_PARAMS,
+                                  target_pre3)
+        if rows is not None:
+            members.append((BLEND[3], rows))
+    if not members:
+        return None
+    total = sum(w for w, _ in members)
+    blended = []
+    for i in range(23):
+        blended.append([sum(w * rows[i][j] for w, rows in members) / total
+                        for j in range(5)])
+    return blended
 
 
 def baseline_forecast(p1):
@@ -381,14 +490,15 @@ def forecast_case(case, params=PARAMS):
     if case["levels"] != LEVELS:
         raise ValueError(f"case asks for levels {case['levels']}, not {LEVELS}")
     p1, pool = build_pool(case, params)
-    if len(pool) < params["min_pool"]:
+    if not pool:
         return baseline_forecast(p1)
     target_pre3 = pre_release_heat(case.get("history_hourly"),
                                    case["day_start"], math.log(p1))
-    result = forecast_from_pool(p1, pool, params, target_pre3)
-    if result is None:
+    _, global_pool = build_pool(case, GLOBAL_PARAMS)
+    rows = ensemble_rows(p1, pool, global_pool, target_pre3)
+    if rows is None:
         return baseline_forecast(p1)
-    return result
+    return format_rows(p1, rows)
 
 
 def main():
