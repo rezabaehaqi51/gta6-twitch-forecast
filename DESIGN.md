@@ -83,6 +83,47 @@ found and fixed in the process — a minimum-pool gate in the entry
 path sent small-hour-1 targets to the persistence fallback that the
 validation never used.
 
+## v4 — re-weighted blend + asymmetric post-calibration (tools/tune6*.py)
+
+v4 was tuned against the shipped ensemble itself, through a new
+harness (tools/lolo_ens.py) that rebuilds each target's base and
+global sub-pools and calls main.ensemble_rows — it reproduces v3's
+numbers exactly before any variant is trusted (union 0.1996,
+GTA-family 0.144). 105 variants were scored: blend-weight moves,
+post-blend spread calibration (global / per-block / asymmetric /
+tail), every PARAMS and GLOBAL_PARAMS knob one at a time, the heat
+kernel's width and the smoothing width. Diagnostics
+(tools/diag_spread.py) showed plain widening buys its union gain on
+five mid-size off-family targets whose shapes the pool misses, while
+taxing the GTA family — so the adopted stack takes the widening only
+where the residuals say it belongs:
+
+* blend weights (0.65 / 0.18 / 0.12 / 0.05) -> (0.60 / 0.18 / 0.12 /
+  0.10): the low-variance global member earns a larger share;
+* sp_lo 1.0 -> 1.05 in the members' own calibration (the global
+  member inherits it);
+* a post-blend asymmetric calibration on the blended rows: below
+  each hour's median x1.05, above it x0.95 (POST_LO / POST_HI).
+
+| target set | v4 | v3 |
+| --- | --- | --- |
+| GTA-family | 0.146 | 0.144 |
+| launches with hour 1 ≥ 100k | **0.209** | 0.214 |
+| union of the two (21) | **0.196** | 0.200 |
+| all 37 launches | 0.452 | 0.449 |
+| union coverage of the 90% interval | **0.857** | 0.820 |
+
+Robustness: the candidate wins both split halves of the union set,
+wins all 20 leave-one-target-out jackknife drops, and beats v3 on
+12 of 21 union targets head-to-head. Rejected at this gate: a wider
+global spread (union 0.195 at spread 0.75, but GTA-family 0.148 —
+spends nearly the whole family budget for a worse trade), per-hour
+spread calibration on the blend, tilt/spread knob moves that only
+re-shuffle the same trade, and seven probes around the adopted stack
+that gained <= 0.0005 (inside the noise band). The full-pool mean
+worsens slightly (0.449 -> 0.452), the same deliberate specialisation
+away from off-posture targets as v2/v3.
+
 ## Data notes
 
 - `platforms` in a case is one comma-separated string, not a list — the

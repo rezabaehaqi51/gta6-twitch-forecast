@@ -31,8 +31,12 @@ hour 1. The case ships the full hourly curves of ~40 past big launches
      neighbouring hours before quantiles are taken (shape first, hourly
      noise second); and with a low-variance global parameter set (wide
      size kernel, weak tier discounts) — and the four log-quantile sets
-     are averaged with fixed weights (0.65 / 0.18 / 0.12 / 0.05) fitted
-     by the same leave-one-launch-out validation. No single variant beat
+     are averaged with fixed weights (0.60 / 0.18 / 0.12 / 0.10) fitted
+     by the same leave-one-launch-out validation. A last calibration
+     pass on the blended rows widens the lower side of each hour's
+     interval (x1.05 around the median) and narrows the upper side
+     (x0.95): across launches the model's misses run asymmetric, with
+     downside surprises fatter than upside ones. No single variant beat
      the base model on every validation subset; the blend ties it on
      GTA-family launches and beats it on big launches and on the union
      of the two, which is the posture wanted for a target that is both.
@@ -66,13 +70,13 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]  # standard normal quantiles
 
 # --- Model parameters (fitted by tools/lolo.py + tools/tune2.py) ---
-# LOLO over the 37 launches in the practice cases: GTA-family targets
-# (console-only, full tier, rolling unlock) score 0.144 against the house
-# baseline's 0.344 on the same targets; launches with hour 1 >= 100k
-# score 0.214 under the v3 ensemble (0.220 for this base member alone);
-# the full pool scores 0.449. The v2 additions are a
-# pre-release heat tilt (pre_shrink) and per-hour-block / asymmetric /
-# tail spread calibration. See tools/tune2.py and DESIGN.md.
+# LOLO over the 37 launches in the practice cases, scored through the
+# shipped ensemble (tools/lolo_ens.py): GTA-family targets score 0.146
+# against the house baseline's 0.344 on the same targets; launches with
+# hour 1 >= 100k score 0.209; the union of the two sets scores 0.196;
+# the full pool scores 0.452. v4 (tools/tune6*.py) changed three things
+# from v3: the blend weights, sp_lo, and a post-blend asymmetric
+# calibration (POST_LO / POST_HI below). See DESIGN.md.
 PARAMS = {
     "w_tier_early": 0.5,       # early-access tier weight factor
     "w_tier_weak": 0.5,        # live-service / weak tier weight factor
@@ -86,7 +90,7 @@ PARAMS = {
     "sp_g2": 1.0,              # spread multiplier, hours 6-12
     "sp_g3": 0.85,             # spread multiplier, hours 13-18
     "sp_g4": 0.85,             # spread multiplier, hours 19-24
-    "sp_lo": 1.0,              # extra multiplier below the median
+    "sp_lo": 1.05,             # extra multiplier below the median
     "sp_hi": 0.85,             # extra multiplier above the median
     "tail": 1.1,               # extra multiplier on the 5%/95% quantiles
     "smooth": 0,               # 1: smooth log quantiles over neighbouring hours
@@ -107,9 +111,15 @@ GLOBAL_PARAMS = dict(PARAMS, size_sigma=4.0, size_floor=0.3,
 
 # Ensemble weights over (base, heat-kernel, smoothed-curves, global),
 # fitted by leave-one-launch-out on the union of GTA-family and big
-# launches (tools/tune5.py): union 0.200 vs the base model's 0.205,
-# GTA-family 0.144 vs 0.144, big launches 0.214 vs 0.220.
-BLEND = (0.65, 0.18, 0.12, 0.05)
+# launches (tools/tune5.py, re-weighted by tools/tune6.py for v4):
+# union 0.196 vs the base model's 0.205, GTA-family 0.146,
+# big launches 0.209.
+BLEND = (0.60, 0.18, 0.12, 0.10)
+# Post-blend asymmetric calibration around each hour's blended median:
+# the lower side widens, the upper side narrows (tools/tune6.py).
+# LOLO union coverage of the 90% interval rises 0.820 -> 0.852.
+POST_LO = 1.05
+POST_HI = 0.95
 PRE_KERNEL_SIGMA = 1.0   # width of the pre-release heat kernel
 SMOOTH_WIDTH = 5         # moving-average width for the smoothed member
 
@@ -467,7 +477,15 @@ def ensemble_rows(p1, pool, global_pool, target_pre3):
     for i in range(23):
         blended.append([sum(w * rows[i][j] for w, rows in members) / total
                         for j in range(5)])
-    return blended
+    # Post-blend asymmetric calibration: widen below the blended
+    # median, narrow above it (POST_LO / POST_HI).
+    calibrated = []
+    for qs in blended:
+        med = qs[2]
+        calibrated.append([med + (q - med) * (POST_LO if j < 2 else
+                                              POST_HI if j > 2 else 1.0)
+                           for j, q in enumerate(qs)])
+    return calibrated
 
 
 def baseline_forecast(p1):
